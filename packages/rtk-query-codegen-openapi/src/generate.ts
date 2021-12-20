@@ -1,4 +1,4 @@
-import ts from 'typescript';
+import ts, { TypeAliasDeclaration } from 'typescript';
 import * as path from 'path';
 import { camelCase } from 'lodash';
 import ApiGenerator, {
@@ -73,7 +73,9 @@ export async function generateApi(
     endpointOverrides,
   }: GenerationOptions
 ) {
-  const v3Doc = await getV3Doc(spec);
+  let v3Doc = await getV3Doc(spec);
+  let { schemas, fixedEnumDeclarations } = fixEnumTypes(v3Doc.components?.schemas);
+  v3Doc = { ...v3Doc, components: { ...v3Doc.components, schemas } };
 
   const apiGen = new ApiGenerator(v3Doc, {});
 
@@ -136,7 +138,12 @@ export async function generateApi(
           undefined
         ),
         ...Object.values(interfaces),
-        ...apiGen['aliases'],
+        ...apiGen['aliases'].filter(
+          //filter incorrect enum declarations
+          (x) => !fixedEnumDeclarations.find((ce) => ce.name.escapedText === x.name.escapedText)
+        ),
+        //Add fixed enum declarations
+        ...fixedEnumDeclarations,
         ...(hooks
           ? [generateReactHooks({ exportName: generatedApiName, operationDefinitions, endpointOverrides })]
           : []),
@@ -438,6 +445,46 @@ function generateQuerArgObjectLiteralExpression(queryArgs: QueryArgDefinition[],
   return factory.createObjectLiteralExpression(
     queryArgs.map((param) => createPropertyAssignment(param.originalName, accessProperty(rootObject, param.name)), true)
   );
+}
+
+function generateEnum(name: string, enumMembers: string[], enumMembersValues: number[] | string[]) {
+  return factory.createEnumDeclaration(
+    [],
+    [factory.createModifier(ts.SyntaxKind.ExportKeyword)],
+    name,
+    enumMembers.map((memberName, i) =>
+      factory.createEnumMember(
+        memberName,
+        typeof enumMembersValues[i] === 'number'
+          ? factory.createNumericLiteral(enumMembersValues[i])
+          : factory.createStringLiteral(enumMembersValues[i] as string)
+      )
+    )
+  );
+}
+
+function fixEnumTypes(schemas?: { [key: string]: OpenAPIV3.ReferenceObject | OpenAPIV3.SchemaObject }) {
+  let fixedSchemas: { [key: string]: OpenAPIV3.ReferenceObject | OpenAPIV3.SchemaObject } = {};
+  let fixedEnumDeclarations: ts.EnumDeclaration[] = [];
+
+  for (const [key, value] of Object.entries(schemas ?? {})) {
+    const schema = value as any;
+    if (value && schema.enum) {
+      //map enum values to string - hotfix for code generator....
+      fixedSchemas[key] = { ...value, enum: (value as any).enum.map((x: string | number) => `${x}`) };
+
+      if (schema['x-enumNames']) {
+        //generate correct enum node
+        fixedEnumDeclarations.push(
+          generateEnum(key, schema['x-enumNames'] as string[], schema.enum as number[] | string[])
+        );
+      }
+    } else {
+      fixedSchemas[key] = value;
+    }
+  }
+
+  return { schemas: fixedSchemas, fixedEnumDeclarations };
 }
 
 type QueryArgDefinition = {
